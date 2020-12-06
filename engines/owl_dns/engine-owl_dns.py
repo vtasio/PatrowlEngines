@@ -6,7 +6,10 @@ import validators
 import whois
 from modules.dnstwist import dnstwist
 from concurrent.futures import ThreadPoolExecutor
-
+import logging
+#import sublist3r
+import subprocess
+import concurrent.futures
 
 app = Flask(__name__)
 APP_DEBUG = False
@@ -24,7 +27,7 @@ this.scan_lock = threading.RLock()
 this.resolver = dns.resolver.Resolver()
 this.resolver.lifetime = this.resolver.timeout = 5.0
 
-this.pool = ThreadPoolExecutor(4)
+this.pool = ThreadPoolExecutor(20)
 
 
 @app.route('/')
@@ -111,58 +114,44 @@ def start_scan():
     if 'do_whois' in scan['options'].keys() and data['options']['do_whois']:
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = threading.Thread(target=_get_whois, args=(scan_id, asset["value"],))
-                th.start()
+                th = this.pool.submit(_get_whois, scan_id, asset["value"])
                 this.scans[scan_id]['threads'].append(th)
 
     if 'do_advanced_whois' in scan['options'].keys() and data['options']['do_advanced_whois']:
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = threading.Thread(target=_get_whois, args=(scan_id, asset["value"],))
-                th.start()
+                th = this.pool.submit(_get_whois, scan_id, asset["value"])
                 this.scans[scan_id]['threads'].append(th)
 
     # subdomains enumeration using search engines, VT and public PassiveDNS API
     if 'do_subdomain_enum' in scan['options'].keys() and data['options']['do_subdomain_enum']:
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = threading.Thread(target=_subdomain_enum, args=(scan_id, asset["value"],))
-                th.start()
+                th=this.pool.submit(_subdomain_enum, scan_id, asset["value"])
                 this.scans[scan_id]['threads'].append(th)
-
-                # th = threading.Thread(target=_subdomain_enum, args=(scan_id, asset["value"],))
-                # this.scans[scan_id]['threads'].append(th)
-                # th.daemon = False
-                # th.start()
-                # #th.do_run = False
-                # th.join()
 
     if 'do_subdomains_resolve' in scan['options'].keys() and data['options']['do_subdomains_resolve']:
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = threading.Thread(target=_dns_resolve, args=(scan_id, asset["value"], True))
-                th.start()
+                th = this.pool.submit(_dns_resolve, scan_id, asset["value"], True)
                 this.scans[scan_id]['threads'].append(th)
 
     if 'do_dns_resolve' in scan['options'].keys() and data['options']['do_dns_resolve']:
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = threading.Thread(target=_dns_resolve, args=(scan_id, asset["value"], False))
-                th.start()
+                th = this.pool.submit(_dns_resolve, scan_id, asset["value"], False)
                 this.scans[scan_id]['threads'].append(th)
 
     if 'do_subdomain_bruteforce' in scan['options'].keys() and data['options']['do_subdomain_bruteforce']:
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = threading.Thread(target=_subdomain_bruteforce, args=(scan_id, asset["value"],))
-                th.start()
+                th = this.pool.submit(_subdomain_bruteforce, scan_id, asset["value"])
                 this.scans[scan_id]['threads'].append(th)
 
     if 'do_reverse_dns' in scan['options'].keys() and data['options']['do_reverse_dns']:
         for asset in data["assets"]:
             if asset["datatype"] == "ip":
-                th = threading.Thread(target=_reverse_dns, args=(scan_id, asset["value"]))
-                th.start()
+                th = this.pool.submit(_reverse_dns, scan_id, asset["value"])
                 this.scans[scan_id]['threads'].append(th)
 
     if 'do_dnstwist_subdomain_search' in scan['options'].keys() and data['options']['do_dnstwist_subdomain_search']:
@@ -191,10 +180,9 @@ def start_scan():
 
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = this.pool.submit(dnstwist.search_subdomains, scan_id, asset["value"], tld, check_ssdeep, check_geoip, check_mx, check_whois, check_banners, timeout)
                 this.scans[scan_id]['dnstwist'][asset["value"]] = {}
+                th = this.pool.submit(dnstwist.search_subdomains, scan_id, asset["value"], tld, check_ssdeep, check_geoip, check_mx, check_whois, check_banners, timeout)
                 this.scans[scan_id]['futures'].append(th)
-
     res.update({
         "status": "accepted",
         "details": {
@@ -368,22 +356,21 @@ def _subdomain_bruteforce(scan_id, asset):
 
 def _subdomain_enum(scan_id, asset):
     res = {}
-
+    subfinder_res=[]
     # check the asset is a valid domain name
     if not __is_domain(asset):
         return res
-
-    # sub_res = turbolist3r.main(
-    sub_res = sublist3r.main(
-        asset, 1, None,
-        ports=None,
-        silent=True,
-        verbose=True,
-        enable_bruteforce=False,
-        engines=None)
-
-    res.update({asset: sub_res})
-
+    #sub_res = sublist3r.main(
+    #    asset, 1, None,
+    #    ports=None,
+    #    silent=True,
+    #    verbose=True,
+    #    enable_bruteforce=False,
+    #    engines="baidu,yahoo,google,bing,ask,dnsdumpster,virustotal,threatcrowd,ssl,passivedns")
+    subfinder = os.popen('/home/pentester/go/bin/subfinder -d '+asset+' -silent').read()
+    subfinder_res = subfinder.split("\n")
+    subfinder_res = [i for i in subfinder_res if i]
+    res.update({asset: subfinder_res})
     # scan_lock = threading.RLock()
     if 'subdomains_list' in this.scans[scan_id]['findings'].keys():
         if asset in this.scans[scan_id]['findings']['subdomains_list']:
@@ -392,12 +379,11 @@ def _subdomain_enum(scan_id, asset):
                     this.scans[scan_id]['findings']['subdomains_list'][asset].extend(sub_res)
         else:
             # with this.scan_lock:
-            this.scans[scan_id]['findings']['subdomains_list'][asset] = list(sub_res)
+            this.scans[scan_id]['findings']['subdomains_list'][asset] = list(subfinder_res)
     else:
         # with this.scan_lock:
         this.scans[scan_id]['findings']['subdomains_list'] = {}
-        this.scans[scan_id]['findings']['subdomains_list'][asset] = list(sub_res)
-
+        this.scans[scan_id]['findings']['subdomains_list'][asset] = list(subfinder_res)
     # time.sleep(2)
     return res
 
@@ -472,14 +458,13 @@ def scan_status(scan_id):
     for t in this.scans[scan_id]['threads']:
         #print ("status/thread:", t)
         #print ("status/thread.isAlive():", t.isAlive())
-        if t.isAlive():
+        if not t.done():
             this.scans[scan_id]['status'] = "SCANNING"
             all_threads_finished = False
-            break
+            # print(f._result)
         else:
             this.scans[scan_id]['threads'].remove(t)
             #all_threads_finished = True
-
     for f in this.scans[scan_id]['futures']:
         if not f.done():
             this.scans[scan_id]['status'] = "SCANNING"
@@ -569,7 +554,7 @@ def _parse_results(scan_id):
         for asset in scan['findings']['dns_resolve'].keys():
 
             dns_resolve_str = ""
-            for record in sorted(scan['findings']['dns_resolve'][asset]):
+            for record in scan['findings']['dns_resolve'][asset]:
                 entry = "Record type '{}': {}".format(
                     record['record_type'], ", ".join(record['values']))
                 dns_resolve_str = "".join((dns_resolve_str, entry+"\n"))
