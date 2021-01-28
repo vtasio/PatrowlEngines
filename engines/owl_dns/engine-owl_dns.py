@@ -6,14 +6,16 @@ import validators
 import whois
 from modules.dnstwist import dnstwist
 from concurrent.futures import ThreadPoolExecutor
-
+import logging
+#import sublist3r
+import subprocess
+import concurrent.futures
 
 app = Flask(__name__)
 APP_DEBUG = False
 APP_HOST = "0.0.0.0"
 APP_PORT = 5006
-# APP_MAXSCANS = int(os.environ.get('APP_MAXSCANS', 10))
-APP_MAXSCANS = int(os.environ.get('APP_MAXSCANS', 5))
+APP_MAXSCANS = 25
 APP_TIMEOUT = 3600
 
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -25,7 +27,7 @@ this.scan_lock = threading.RLock()
 this.resolver = dns.resolver.Resolver()
 this.resolver.lifetime = this.resolver.timeout = 5.0
 
-this.pool = ThreadPoolExecutor(4)
+this.pool = ThreadPoolExecutor(20)
 
 
 @app.route('/')
@@ -112,54 +114,44 @@ def start_scan():
     if 'do_whois' in scan['options'].keys() and data['options']['do_whois']:
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = threading.Thread(target=_get_whois, args=(scan_id, asset["value"],))
-                th.start()
+                th = this.pool.submit(_get_whois, scan_id, asset["value"])
                 this.scans[scan_id]['threads'].append(th)
 
     if 'do_advanced_whois' in scan['options'].keys() and data['options']['do_advanced_whois']:
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = threading.Thread(target=_get_whois, args=(scan_id, asset["value"],))
-                th.start()
+                th = this.pool.submit(_get_whois, scan_id, asset["value"])
                 this.scans[scan_id]['threads'].append(th)
 
     # subdomains enumeration using search engines, VT and public PassiveDNS API
     if 'do_subdomain_enum' in scan['options'].keys() and data['options']['do_subdomain_enum']:
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = threading.Thread(target=_subdomain_enum, args=(scan_id, asset["value"],))
-                th.daemon = True
-                th.start()
+                th=this.pool.submit(_subdomain_enum, scan_id, asset["value"])
                 this.scans[scan_id]['threads'].append(th)
 
     if 'do_subdomains_resolve' in scan['options'].keys() and data['options']['do_subdomains_resolve']:
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = threading.Thread(target=_dns_resolve, args=(scan_id, asset["value"], True))
-                th.daemon = True
-                th.start()
+                th = this.pool.submit(_dns_resolve, scan_id, asset["value"], True)
                 this.scans[scan_id]['threads'].append(th)
 
     if 'do_dns_resolve' in scan['options'].keys() and data['options']['do_dns_resolve']:
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = threading.Thread(target=_dns_resolve, args=(scan_id, asset["value"], False))
-                th.start()
+                th = this.pool.submit(_dns_resolve, scan_id, asset["value"], False)
                 this.scans[scan_id]['threads'].append(th)
 
     if 'do_subdomain_bruteforce' in scan['options'].keys() and data['options']['do_subdomain_bruteforce']:
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = threading.Thread(target=_subdomain_bruteforce, args=(scan_id, asset["value"],))
-                th.daemon = True
-                th.start()
+                th = this.pool.submit(_subdomain_bruteforce, scan_id, asset["value"])
                 this.scans[scan_id]['threads'].append(th)
 
     if 'do_reverse_dns' in scan['options'].keys() and data['options']['do_reverse_dns']:
         for asset in data["assets"]:
             if asset["datatype"] == "ip":
-                th = threading.Thread(target=_reverse_dns, args=(scan_id, asset["value"]))
-                th.start()
+                th = this.pool.submit(_reverse_dns, scan_id, asset["value"])
                 this.scans[scan_id]['threads'].append(th)
 
     if 'do_dnstwist_subdomain_search' in scan['options'].keys() and data['options']['do_dnstwist_subdomain_search']:
@@ -188,10 +180,9 @@ def start_scan():
 
         for asset in data["assets"]:
             if asset["datatype"] == "domain":
-                th = this.pool.submit(dnstwist.search_subdomains, scan_id, asset["value"], tld, check_ssdeep, check_geoip, check_mx, check_whois, check_banners, timeout)
                 this.scans[scan_id]['dnstwist'][asset["value"]] = {}
+                th = this.pool.submit(dnstwist.search_subdomains, scan_id, asset["value"], tld, check_ssdeep, check_geoip, check_mx, check_whois, check_banners, timeout)
                 this.scans[scan_id]['futures'].append(th)
-
     res.update({
         "status": "accepted",
         "details": {
@@ -224,12 +215,14 @@ def _dns_resolve(scan_id, asset, check_subdomains=False):
 
     res.update({asset: __dns_resolve_asset(asset)})
 
+    # scan_lock = threading.RLock()
     with this.scan_lock:
         this.scans[scan_id]["findings"]["dns_resolve"] = res
 
     if check_subdomains:
         res_dom = {}
         subdomains = _subdomain_enum(scan_id, asset)
+        # print "subdomains:", subdomains
         for a in subdomains.keys():
             for s in subdomains[a]:
                 data = __dns_resolve_asset(s)
@@ -253,10 +246,13 @@ def __dns_resolve_asset(asset):
                     "values": [str(rdata) for rdata in answers]
                 })
             except dns.resolver.NoAnswer:
+                # print "*** No answer ***"
                 pass
             except dns.resolver.Timeout:
+                # print "*** No answer ***"
                 pass
     except dns.resolver.NXDOMAIN:
+        # print "*** The name", t, "does not exist ***"
         pass
     return sub_res
 
@@ -332,6 +328,7 @@ def _subdomain_bruteforce(scan_id, asset):
     for sub in SUB_LIST:
         subdom = ".".join((sub, asset))
         results = __dns_resolve_asset(subdom)
+        # print subdom, ":", results
 
         if len(results) > 0:
             valid_sudoms.append(subdom)
@@ -352,26 +349,29 @@ def _subdomain_bruteforce(scan_id, asset):
     # @todo: add the subdomain resolve in scan['findings']['subdomains_resolve'] if not exists
     # @todo: mutex on this.scans[scan_id]['findings']['subdomains_resolve']
 
+
+    # print this.scans[scan_id]['findings']['subdomains_list']
     return res
 
 
 def _subdomain_enum(scan_id, asset):
     res = {}
-
+    subfinder_res=[]
     # check the asset is a valid domain name
     if not __is_domain(asset):
         return res
-
-    sub_res = sublist3r.main(
-        asset, 1, None,
-        ports=None,
-        silent=True,
-        verbose=True,
-        enable_bruteforce=False,
-        engines=None)
-
-    res.update({asset: sub_res})
-
+    #sub_res = sublist3r.main(
+    #    asset, 1, None,
+    #    ports=None,
+    #    silent=True,
+    #    verbose=True,
+    #    enable_bruteforce=False,
+    #    engines="baidu,yahoo,google,bing,ask,dnsdumpster,virustotal,threatcrowd,ssl,passivedns")
+    subfinder = os.popen('/home/pentester/go/bin/subfinder -d '+asset+' -silent').read()
+    subfinder_res = subfinder.split("\n")
+    subfinder_res = [i for i in subfinder_res if i]
+    res.update({asset: subfinder_res})
+    # scan_lock = threading.RLock()
     if 'subdomains_list' in this.scans[scan_id]['findings'].keys():
         if asset in this.scans[scan_id]['findings']['subdomains_list']:
             for subdom in sub_res:
@@ -379,12 +379,11 @@ def _subdomain_enum(scan_id, asset):
                     this.scans[scan_id]['findings']['subdomains_list'][asset].extend(sub_res)
         else:
             # with this.scan_lock:
-            this.scans[scan_id]['findings']['subdomains_list'][asset] = list(sub_res)
+            this.scans[scan_id]['findings']['subdomains_list'][asset] = list(subfinder_res)
     else:
         # with this.scan_lock:
         this.scans[scan_id]['findings']['subdomains_list'] = {}
-        this.scans[scan_id]['findings']['subdomains_list'][asset] = list(sub_res)
-
+        this.scans[scan_id]['findings']['subdomains_list'][asset] = list(subfinder_res)
     # time.sleep(2)
     return res
 
@@ -405,11 +404,7 @@ def stop_scan(scan_id):
     for t in this.scans[scan_id]['threads']:
         # t._Thread__stop()
         # t.terminate()
-        try:
-            t.join()
-            this.scans[scan_id]['threads'].remove(t)
-        except Exception:
-            pass
+        t.join()
     this.scans[scan_id]['status'] = "STOPPED"
     this.scans[scan_id]['finished_at'] = int(time.time() * 1000)
 
@@ -446,30 +441,6 @@ def clean_scan(scan_id):
         res.update({"status": "error", "reason": "scan_id '{}' not found".format(scan_id)})
         return jsonify(res)
 
-    # Terminate thread if any
-    for t in this.scans[scan_id]['threads']:
-        try:
-            # t._Thread__stop()
-            # t.terminate()
-            # print("{}: clean threads '{}'".format(scan_id, t))
-            t.join()
-            this.scans[scan_id]['threads'].remove(t)
-        except Exception as e:
-            print(e)
-            pass
-    #
-    # for t in this.scans[scan_id]['futures']:
-    #     try:
-    #         # t._Thread__stop()
-    #         # t.terminate()
-    #         print("{}: clean futures '{}'".format(scan_id, t))
-    #         print(dir(t))
-    #         # t.join()
-    #     except Exception as e:
-    #         print(e)
-    #         pass
-
-    # Remove Scan for current scans
     this.scans.pop(scan_id)
     res.update({"status": "removed"})
     return jsonify(res)
@@ -485,26 +456,33 @@ def scan_status(scan_id):
     all_threads_finished = True
 
     for t in this.scans[scan_id]['threads']:
-        # print("scan_status-thread:", t.name, t.native_id)
-        if t.is_alive():
+        #print ("status/thread:", t)
+        #print ("status/thread.isAlive():", t.isAlive())
+        if not t.done():
             this.scans[scan_id]['status'] = "SCANNING"
             all_threads_finished = False
-            break
+            # print(f._result)
         else:
-            # Terminate thread
-            t.join()
             this.scans[scan_id]['threads'].remove(t)
-
+            #all_threads_finished = True
     for f in this.scans[scan_id]['futures']:
         if not f.done():
             this.scans[scan_id]['status'] = "SCANNING"
             all_threads_finished = False
+            # print(f._result)
             break
         else:
             dnstwist_asset, dnstwist_results = f.result()
             this.scans[scan_id]['dnstwist'][dnstwist_asset] = dnstwist_results
             this.scans[scan_id]['futures'].remove(f)
 
+            #all_threads_finished = True
+
+    # if 'futures' in this.scans[scan_id].keys():
+        # print ("status/len(futures):", len(this.scans[scan_id]['futures']))
+    #print "status/len(threads):", len(this.scans[scan_id]['threads'])
+    #print "status/all_threads_finished:", all_threads_finished, ", ", len(this.scans[scan_id]['threads'])
+    # if all_threads_finished and len(this.scans[scan_id]['threads']) >=1:
     if all_threads_finished and len(this.scans[scan_id]['threads']) == 0 and len(this.scans[scan_id]['futures']) == 0:
         this.scans[scan_id]['status'] = "FINISHED"
         this.scans[scan_id]['finished_at'] = int(time.time() * 1000)
@@ -535,10 +513,6 @@ def status():
         "status": this.scanner['status'],
         "scanner": this.scanner,
         "scans": scans})
-
-    # print("thread-count:", threading.active_count())
-    # for thread in threading.enumerate():
-    #     print("{}:{}".format(thread.name, thread.native_id))
     return jsonify(res)
 
 
@@ -564,6 +538,8 @@ def _parse_results(scan_id):
 
     # dnstwist
     if 'dnstwist' in this.scans[scan_id].keys():
+        # for domain in this.scans[scan_id]['dnstwist']:
+        #     print(domain['domain-name'])
         for asset in this.scans[scan_id]['dnstwist'].keys():
             dnstwist_issues = dnstwist.parse_results(
                 ts, asset, this.scans[scan_id]['dnstwist'][asset])
@@ -578,7 +554,7 @@ def _parse_results(scan_id):
         for asset in scan['findings']['dns_resolve'].keys():
 
             dns_resolve_str = ""
-            for record in sorted(scan['findings']['dns_resolve'][asset]):
+            for record in scan['findings']['dns_resolve'][asset]:
                 entry = "Record type '{}': {}".format(
                     record['record_type'], ", ".join(record['values']))
                 dns_resolve_str = "".join((dns_resolve_str, entry+"\n"))
@@ -666,24 +642,17 @@ def _parse_results(scan_id):
     # subdomain list
 
     # bad messages replied by Sublist3r
-    bad_str = [
-        "Go to http://PTRarchive.com for best",
-        "Use http://PTRarchive.com, the engine",
-        "Sublist3r recommends",
-        "API count exceeded",
-        "Too Many Requests",
-        "<", ">",
-    ]
+    bad_str = ["Go to http://PTRarchive.com for best",
+               "Use http://PTRarchive.com, the engine",
+               "Sublist3r recommends"]
     if 'subdomains_list' in scan['findings'].keys():
         for asset in scan['findings']['subdomains_list'].keys():
             subdomains_str = ""
             subdomains_list = sorted(set(scan['findings']['subdomains_list'][asset]))
-            subdomains_list_clean = []
             for subdomain in subdomains_list:
-                if any(x in subdomain for x in bad_str) or subdomain.replace(' ','') == '':
+                if any(x in subdomain for x in bad_str):
                     continue
                 s = subdomain.replace("From http://PTRarchive.com: ", "")
-                subdomains_list_clean.append(s)
                 subdomains_str = "".join((subdomains_str, s+"\n"))
 
                 # New issue when a subdomain is found
@@ -708,8 +677,8 @@ def _parse_results(scan_id):
 
             # New issue when on the domain list
             subdomains_hash = hashlib.sha1(subdomains_str.encode("utf-8")).hexdigest()[:6]
-            if len(subdomains_list_clean) == 0:
-                subdomains_list_clean = []
+            if len(subdomains_list) == 0:
+                subdomains_list = []
 
             nb_vulns['info'] += 1
             issues.append({
@@ -720,7 +689,7 @@ def _parse_results(scan_id):
                     "protocol": "domain"
                     },
                 "title": "List of subdomains for '{}' ({} found, HASH: {})".format(
-                    asset, len(subdomains_list_clean), subdomains_hash),
+                    asset, len(subdomains_list), subdomains_hash),
                 "description": "Subdomain list for '{}': \n\n{}".format(
                     asset, subdomains_str),
                 "solution": "n/a",
@@ -728,7 +697,7 @@ def _parse_results(scan_id):
                     "tags": ["domains", "subdomains"]
                 },
                 "type": "subdomains_enum",
-                "raw": subdomains_list_clean,
+                "raw": subdomains_list,
                 "timestamp": ts
             })
 
@@ -905,9 +874,7 @@ def _parse_results(scan_id):
                         "description": "[Whois] '{}' domain is expired since '{}' (less than 2 weeks)\n\nAll dates in record: {}".format(
                             asset,
                             exp_date.date().isoformat(),
-                            ", ".join(exp_date.date().isoformat())
-                            # ", ".join(expiry_dates)
-                        ),
+                            ", ".join(expiry_dates)),
                         "raw": scan['findings']['whois'][asset]['raw']['expiration_date'],
                         "solution": "Renew the domain"
                     })
@@ -923,9 +890,7 @@ def _parse_results(scan_id):
                         "description": "[Whois] '{}' domain is registred until '{}' (less than 2 weeks)\n\nAll dates in record: {}".format(
                             asset,
                             exp_date.date().isoformat(),
-                            ", ".join(exp_date.date().isoformat())
-                            # ", ".join(expiry_dates)
-                        ),
+                            ", ".join(expiry_dates)),
                         "raw": scan['findings']['whois'][asset]['raw']['expiration_date'],
                         "solution": "Renew the domain"
                     })
@@ -941,9 +906,7 @@ def _parse_results(scan_id):
                         "description": "[Whois] '{}' domain is registred until '{}' (less than 3 months)\n\nAll dates in record: {}".format(
                             asset,
                             exp_date.date().isoformat(),
-                            ", ".join(exp_date.date().isoformat())
-                            # ", ".join(expiry_dates)
-                        ),
+                            ", ".join(expiry_dates)),
                         "raw": scan['findings']['whois'][asset]['raw']['expiration_date'],
                         "solution": "Renew the domain"
                     })
@@ -959,9 +922,7 @@ def _parse_results(scan_id):
                         "description": "[Whois] '{}' domain is registred until '{}' (less than 6 months)\n\nAll dates in record: {}".format(
                             asset,
                             exp_date.date().isoformat(),
-                            ", ".join(exp_date.date().isoformat())
-                            # ", ".join(expiry_dates)
-                        ),
+                            ", ".join(expiry_dates)),
                         "raw": scan['findings']['whois'][asset]['raw']['expiration_date'],
                         "solution": "Renew the domain"
                     })
@@ -974,6 +935,7 @@ def _parse_results(scan_id):
         "nb_medium": nb_vulns["medium"],
         "nb_high": nb_vulns["high"],
         "nb_critical": nb_vulns["critical"],
+        # "delta_time": results["delta_time"],
         "engine_name": "owl_dns",
         "engine_version": this.scanner["version"]
     }
@@ -991,8 +953,7 @@ def getfindings(scan_id):
         return jsonify(res)
 
     # check if the scan is finished
-    # status()
-    scan_status(scan_id)
+    status()
     if this.scans[scan_id]['status'] != "FINISHED":
         res.update({"status": "error", "reason": "scan_id '{}' not finished (status={})".format(scan_id, this.scans[scan_id]['status'])})
         return jsonify(res)
