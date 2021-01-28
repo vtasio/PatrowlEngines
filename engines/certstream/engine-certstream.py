@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""CertStream PatrOwl engine application."""
+"""
+CertStream PatrOwl engine application
+
+Copyright (C) 2021 Nicolas Mattiocco - @MaKyOtOx
+Licensed under the AGPLv3 License
+Written by Nicolas BEGUIER (nicolas.beguier@adevinta.com)
+"""
 
 from json import dump, dumps, load, loads
 from logging import getLogger
-from os import makedirs
+import os
 from os.path import dirname, exists, isfile, realpath
 from sys import argv, modules, path
 from threading import Thread
@@ -36,19 +42,21 @@ app = Flask(__name__)
 APP_DEBUG = False
 APP_HOST = "0.0.0.0"
 APP_PORT = 5017
-APP_MAXSCANS = 5
+APP_MAXSCANS = int(os.environ.get('APP_MAXSCANS', 5))
 APP_ENGINE_NAME = "certstream"
 APP_BASE_DIR = dirname(realpath(__file__))
 CREATED_CERT_CVSS = 5
 UP_DOMAIN_CVSS = 7
 PARENT_ASSET_CREATE_FINDING_CVSS = 1
 PARENT_ASSET_CREATE_FINDING_CEIL = 0
+VERSION = "1.4.18"
 
 engine = PatrowlEngine(
     app=app,
     base_dir=APP_BASE_DIR,
     name=APP_ENGINE_NAME,
-    max_scans=APP_MAXSCANS
+    max_scans=APP_MAXSCANS,
+    version=VERSION
 )
 
 this = modules[__name__]
@@ -577,7 +585,7 @@ def getfindings(scan_id):
 def main():
     """First function called."""
     if not exists(APP_BASE_DIR+"/results"):
-        makedirs(APP_BASE_DIR+"/results")
+        os.makedirs(APP_BASE_DIR+"/results")
     _loadconfig()
     LOG.debug("Run engine")
 

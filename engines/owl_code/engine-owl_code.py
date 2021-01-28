@@ -22,16 +22,18 @@ from PatrowlEnginesUtils.PatrowlEngineExceptions import PatrowlEngineExceptions
 APP_DEBUG = False
 APP_HOST = "0.0.0.0"
 APP_PORT = 5013
-APP_MAXSCANS = 25
+APP_MAXSCANS = int(os.environ.get('APP_MAXSCANS', 25))
 APP_ENGINE_NAME = "owl_code"
 APP_BASE_DIR = os.path.dirname(os.path.realpath(__file__))
+VERSION = "1.4.18"
 
 app = Flask(__name__)
 engine = PatrowlEngine(
     app=app,
     base_dir=APP_BASE_DIR,
     name=APP_ENGINE_NAME,
-    max_scans=APP_MAXSCANS
+    max_scans=APP_MAXSCANS,
+    version=VERSION
 )
 
 
@@ -108,13 +110,13 @@ def start_scan():
 
     scan_id = res["details"]["scan_id"]
 
-    if "scan_js" in engine.scans[scan_id]["options"].keys() and engine.scans[scan_id]["options"]["scan_js"] == True:
+    if "scan_js" in engine.scans[scan_id]["options"].keys() and engine.scans[scan_id]["options"]["scan_js"] is True:
         for asset in engine.scans[scan_id]["assets"]:
             th = threading.Thread(target=_scanjs_thread, args=(scan_id, asset["value"],))
             th.start()
             engine.scans[scan_id]['threads'].append(th)
 
-    if "scan_owaspdc" in engine.scans[scan_id]["options"].keys() and engine.scans[scan_id]["options"]["scan_owaspdc"] == True:
+    if "scan_owaspdc" in engine.scans[scan_id]["options"].keys() and engine.scans[scan_id]["options"]["scan_owaspdc"] is True:
         for asset in engine.scans[scan_id]["assets"]:
             th = threading.Thread(
                 target=_scanowaspdc_thread,
@@ -148,8 +150,6 @@ def _get_code_from_git_http(asset, wd):
         origin.fetch()
         origin.pull(origin.refs[0].remote_head)
 
-    # git.Repo.clone_from(asset, wd+"/src", depth=1)
-
     return True
 
 
@@ -165,8 +165,10 @@ def _get_code_from_svn_http(scan_id, asset, wd):
             svn_password = engine.scans[scan_id]["options"]["credentials"]["svn_password"]
     else:
         # default engine credentials
-        if "svn_username" in engine.options.keys(): svn_username = engine.options["svn_username"]
-        if "svn_password" in engine.options.keys(): svn_username = engine.options["svn_password"]
+        if "svn_username" in engine.options.keys():
+            svn_username = engine.options["svn_username"]
+        if "svn_password" in engine.options.keys():
+            svn_username = engine.options["svn_password"]
 
     r = svn.remote.RemoteClient(asset, username=svn_username, password=svn_password)
     r.checkout(wd)
@@ -242,7 +244,6 @@ def _scanjs_thread(scan_id, asset_kw):
         report_filename = "{}/oc_{}.json".format(scan_wd_asset, scan_id)
         cmd = 'retire -j --path="{}" --outputformat json --outputpath="{}" -v'.format(
             scan_wd_asset, report_filename)
-        # p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
         p = subprocess.Popen(cmd, shell=True, stdout=open("/dev/null", "w"), stderr=None)
 
         # Wait a little to ensure the report file is completely writen
@@ -252,8 +253,6 @@ def _scanjs_thread(scan_id, asset_kw):
             print("report file '{}' not found.".format(report_filename))
             engine.scans[scan_id]["status"] = "ERROR"
             os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-            # if psutil.pid_exists(p):
-            #     psutil.Process(p).terminate()
             return
 
         scan_results = json.load(open(report_filename))
@@ -288,12 +287,15 @@ def _scanjs_thread(scan_id, asset_kw):
                     if "CVE" in vuln["identifiers"].keys():
                         item_vuln_refs.update({"CVE": vuln["identifiers"]["CVE"]})
 
+                    vuln_severity = vuln["severity"].lower().replace('moderate','medium').replace('unknown','info')
+
                     new_finding = PatrowlEngineFinding(
                         issue_id=issue_id, type="code_js_missing_update",
                         title=item_title,
                         description=item_description,
                         solution="Check the exploitability of the vulnerability in the application context. If the vulnerability is verified, consider updating the library.",
-                        severity=vuln["severity"], confidence="firm",
+                        severity=vuln_severity,
+                        confidence="firm",
                         raw=item,
                         target_addrs=[asset_value],
                         meta_links=vuln["info"],
@@ -399,14 +401,17 @@ def _scanowaspdc_thread(scan_id, asset_kw):
                     remove_prefix(item["filePath"], scan_wd_asset),
                     item["fileName"],
                     vuln["description"].encode('utf-8').strip(),
-                    "\n".join([vs["software"] for vs in vuln["vulnerableSoftware"]])
+                    "\n".join([vs["software"]["id"] for vs in vuln["vulnerableSoftware"]])
                 )
 
                 vuln_risks = {}
                 if "cvssScore" in vuln.keys() and vuln["cvssScore"] != "":
                     vuln_risks.update({"cvss_base_score": float(vuln["cvssScore"])})
 
-                vuln_links = [v["url"] for v in vuln["references"]]
+                vuln_links = []
+                for v in vuln["references"]:
+                    if "url" in v.keys():
+                        vuln_links.append(v["url"])
 
                 vuln_refs = {}
                 if "cwe" in vuln.keys() and vuln["cwe"] != "":
@@ -414,12 +419,15 @@ def _scanowaspdc_thread(scan_id, asset_kw):
                 if vuln["name"].startswith("CVE-"):
                     vuln_refs.update({"CVE": [vuln["name"]]})
 
+                vuln_severity = vuln["severity"].lower().replace('moderate','medium').replace('unknown','info')
+
                 new_finding = PatrowlEngineFinding(
                     issue_id=issue_id, type="code_ext_jar_missing_update",
                     title=item_title,
                     description=item_description,
                     solution="Check the exploitability of the vulnerability in the application context. If the vulnerability is verified, consider updating the library.",
-                    severity=vuln["severity"].lower(), confidence="firm",
+                    severity=vuln_severity,
+                    confidence="firm",
                     raw=vuln,
                     target_addrs=[asset_value],
                     meta_links=vuln_links,
@@ -428,7 +436,6 @@ def _scanowaspdc_thread(scan_id, asset_kw):
                     meta_vuln_refs=vuln_refs)
                 issue_id += 1
                 findings.append(new_finding)
-
 
         # findings summary per asset (remove the workdir)
         checked_files_str = "\n".join([remove_prefix(ff, scan_wd_asset) for ff in sorted(checked_files)])
