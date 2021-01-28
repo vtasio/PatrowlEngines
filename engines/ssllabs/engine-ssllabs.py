@@ -22,16 +22,18 @@ app = Flask(__name__)
 APP_DEBUG = False
 APP_HOST = "0.0.0.0"
 APP_PORT = 5004
-APP_MAXSCANS = 10
+APP_MAXSCANS = int(os.environ.get('APP_MAXSCANS', 25))
 APP_ENGINE_NAME = "ssllabs"
 APP_BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_API_URL = "https://api.ssllabs.com/api/v3/"
+VERSION = "1.4.18"
 
 engine = PatrowlEngine(
     app=app,
     base_dir=APP_BASE_DIR,
     name=APP_ENGINE_NAME,
-    max_scans=APP_MAXSCANS
+    max_scans=APP_MAXSCANS,
+    version=VERSION
 )
 
 requests.packages.urllib3.disable_warnings()

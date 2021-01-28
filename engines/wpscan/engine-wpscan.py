@@ -2,54 +2,50 @@
 """
 WPSCAN PatrOwl engine application
 
-Copyright (C) 2020 Nicolas Mattiocco - @MaKyOtOx
+Copyright (C) 2021 Nicolas Mattiocco - @MaKyOtOx
 Licensed under the AGPLv3 License
 Written by Nicolas BEGUIER (nicolas.beguier@adevinta.com)
 """
 
 from hashlib import sha256
 from logging import getLogger
-from os import makedirs
 from os.path import dirname, exists, realpath
 from sys import argv, modules
 from threading import Thread
 from time import time
 import json
+import os
 import re
 import subprocess
-
-# Third party library imports
 import psutil
 from flask import Flask, request, jsonify
-
-LOG = getLogger("werkzeug")
 
 # Own library imports
 from PatrowlEnginesUtils.PatrowlEngine import _json_serial
 from PatrowlEnginesUtils.PatrowlEngine import PatrowlEngine
 from PatrowlEnginesUtils.PatrowlEngineExceptions import PatrowlEngineExceptions
+from requests import Session
 
 # Debug
 # from pdb import set_trace as st
+
+LOG = getLogger("werkzeug")
 
 app = Flask(__name__)
 APP_DEBUG = False
 APP_HOST = "0.0.0.0"
 APP_PORT = 5023
-APP_MAXSCANS = 5
+APP_MAXSCANS = int(os.environ.get('APP_MAXSCANS', 5))
 APP_ENGINE_NAME = "wpscan"
 APP_BASE_DIR = dirname(realpath(__file__))
-# CREATED_CERT_CVSS = 5
-# UP_DOMAIN_CVSS = 7
-# PARENT_ASSET_CREATE_FINDING_CVSS = 1
-# PARENT_ASSET_CREATE_FINDING_CEIL = 0
-VERSION = "1.0.1"
+VERSION = "1.4.18"
 
 engine = PatrowlEngine(
     app=app,
     base_dir=APP_BASE_DIR,
     name=APP_ENGINE_NAME,
-    max_scans=APP_MAXSCANS
+    max_scans=APP_MAXSCANS,
+    version=VERSION
 )
 
 this = modules[__name__]
@@ -84,6 +80,33 @@ def get_criticity(score):
     elif score < 7.0:
         criticity = "medium"
     return criticity
+
+def get_api_token(api_token_list):
+    """
+    Returns the API key with the most credits
+    """
+    SESSION = Session()
+    top_api_token = None
+    top_api_token_credits = 0
+    for api_token in api_token_list:
+        if not re.fullmatch("[a-zA-Z0-9]+", api_token):
+            continue
+        try:
+           token_status_req = SESSION.get(
+               "https://wpscan.com/api/v3/status",
+               headers={"Authorization": f"Token token={api_token}"})
+        except:
+            continue
+        if token_status_req.status_code != 200:
+            continue
+        try:
+            requests_remaining = json.loads(token_status_req.text)["requests_remaining"]
+        except:
+            requests_remaining = 0
+        if requests_remaining > top_api_token_credits:
+            top_api_token = api_token
+            top_api_token_credits = requests_remaining
+    return top_api_token
 
 
 @app.errorhandler(404)
@@ -166,23 +189,19 @@ def status_scan(scan_id):
         res.update({"status": "error", "reason": "todo"})
         return jsonify(res)
 
-    # has_error = False
-    # has_error_reason = ""
     has_running_thread = False
     for asset in engine.scans[scan_id]["reports"].keys():
-        proc = engine.scans[scan_id]["reports"][asset]["proc"]
+        proc = None
+        # Handle missing proc during first status
+        if "proc" in engine.scans[scan_id]["reports"][asset]:
+            proc = engine.scans[scan_id]["reports"][asset]["proc"]
 
-        if not hasattr(proc, "pid"):
+        if proc and not hasattr(proc, "pid"):
             res.update({"status": "ERROR", "reason": "No PID found"})
             engine.scans[scan_id]["status"] = "ERROR"
             return jsonify(res)
 
-        # if not psutil.pid_exists(proc.pid):
-            # res.update({"status": "FINISHED"})
-            # engine.scans[scan_id]["status"] = "FINISHED"
-
-        # elif psutil.pid_exists(proc.pid) and psutil.Process(proc.pid).status() in ["sleeping", "running"]:
-        if psutil.pid_exists(proc.pid) and psutil.Process(proc.pid).status() in ["sleeping", "running"]:
+        if not proc or (psutil.pid_exists(proc.pid) and psutil.Process(proc.pid).status() in ["sleeping", "running"]):
             has_running_thread = True
             res.update({
                 "status": "SCANNING",
@@ -193,8 +212,6 @@ def status_scan(scan_id):
                     }
             })
         elif psutil.pid_exists(proc.pid) and psutil.Process(proc.pid).status() == "zombie":
-            # res.update({"status": "FINISHED"})
-            # engine.scans[scan_id]["status"] = "FINISHED"
             psutil.Process(proc.pid).terminate()
 
     if has_running_thread is False:
@@ -353,15 +370,6 @@ def _scan_urls(scan_id, asset):
 
     wpscan_cmd = "wpscan"
 
-    # if len(engine.scans[scan_id]["assets"]) != 1:
-    #     return jsonify({
-    #         "status": "refused",
-    #         "details": {
-    #             "reason": "You must specify only one asset to be wpscan!"
-    #         }
-    #     })
-
-    # wordpress_hostname = engine.scans[scan_id]["assets"][0]
     wordpress_hostname = asset
     wordpress_hostname_hash = sha256(wordpress_hostname.encode()).hexdigest()
 
@@ -380,9 +388,11 @@ def _scan_urls(scan_id, asset):
     wpscan_cmd += " --output '{}'".format(engine.scans[scan_id]["reports"][asset]["report_path"])
     wpscan_cmd += " --format json"
 
-    # Add API Token if valid
-    if re.fullmatch("[a-zA-Z0-9]+", engine.scanner["options"]["APIToken"]["value"]):
-        wpscan_cmd += " --api-token '{}'".format(engine.scanner["options"]["APIToken"]["value"])
+    # Add API Token if credits remaining
+    api_token = get_api_token(engine.scanner["options"]["APIToken"]["value"])
+    LOG.warning(f"Token used is {api_token}")
+    if api_token is not None:
+        wpscan_cmd += " --api-token '{}'".format(api_token)
 
     # Extra args
     extra_args = engine.scanner["options"]["extra_args"]
@@ -408,6 +418,40 @@ def get_report(asset, scan_id):
     return result
 
 
+def _parse_description(desc):
+    res = ""
+    for k in desc.keys():
+        res += _parse_item(k, desc[k])
+    return res
+
+
+def _parse_item(key, value, prefix=""):
+    res = ""
+    if key is not None:
+        res = "{}{}:".format(prefix, key)
+    if isinstance(value, (str, int, bool)):
+        return "{} {}\n".format(res, value)
+
+    elif isinstance(value, list):
+        values = "{}:\n".format(key)
+        for subitem in value:
+            values += '{}-'.format(prefix)+_parse_item(None, subitem, "{}{}".format(prefix, " "*2))
+        return values
+
+    elif isinstance(value, dict):
+        if key is None:
+            values = "---------\n"
+        else:
+            values = "{}:\n".format(key)
+        for subitem in value.keys():
+            if isinstance(value[subitem], (str, int, bool)):
+                values += '{}-'.format(prefix)+_parse_item(subitem, value[subitem], ' ')
+            else:
+                values += '{}- '.format(prefix)+_parse_item(subitem, value[subitem], "{}{}".format(prefix, " "*2))
+        return values
+    return res
+
+
 def _parse_results(scan_id):
     issues = []
     summary = {}
@@ -430,7 +474,7 @@ def _parse_results(scan_id):
                 "issue_id": len(issues)+1,
                 "severity": get_criticity(0), "confidence": "certain",
                 "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                "title": "Scan error: {}".format(content["scan_aborted"]),
+                "title": "Scan error: {}".format(content["scan_aborted"]).rstrip(),
                 "solution": "n/a",
                 "metadata": {"risk": {"cvss_base_score": 0}},
                 "type": "wpscan_report",
@@ -451,12 +495,12 @@ def _parse_results(scan_id):
                                 "issue_id": len(issues)+1,
                                 "severity": get_criticity(0), "confidence": "certain",
                                 "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                                "title": "Header: {}".format(interesting_entry),
+                                "title": "Header: {}".format(interesting_entry).rstrip(),
                                 "solution": "n/a",
                                 "metadata": {"risk": {"cvss_base_score": 0}},
                                 "type": "wpscan_report",
                                 "timestamp": timestamp,
-                                "description": json.dumps(interesting_finding, indent=4, sort_keys=True),
+                                "description": _parse_description(interesting_finding),
                             })
                             nb_vulns[get_criticity(0)] += 1
                 # Medium findings
@@ -470,7 +514,7 @@ def _parse_results(scan_id):
                         "metadata": {"risk": {"cvss_base_score": 0}},
                         "type": "wpscan_report",
                         "timestamp": timestamp,
-                        "description": json.dumps(interesting_finding, indent=4, sort_keys=True),
+                        "description": _parse_description(interesting_finding),
                     })
                     nb_vulns[get_criticity(5)] += 1
                 # Info findings
@@ -479,12 +523,12 @@ def _parse_results(scan_id):
                         "issue_id": len(issues)+1,
                         "severity": get_criticity(0), "confidence": "certain",
                         "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                        "title": "Interesting finding: {}".format(interesting_finding['type']),
+                        "title": "Interesting finding: {}".format(interesting_finding['type']).rstrip(),
                         "solution": "n/a",
                         "metadata": {"risk": {"cvss_base_score": 0}},
                         "type": "wpscan_report",
                         "timestamp": timestamp,
-                        "description": json.dumps(interesting_finding, indent=4, sort_keys=True),
+                        "description": _parse_description(interesting_finding),
                     })
                     nb_vulns[get_criticity(0)] += 1
 
@@ -494,12 +538,12 @@ def _parse_results(scan_id):
                 "issue_id": len(issues)+1,
                 "severity": get_criticity(0), "confidence": "certain",
                 "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                "title": "Theme: {}".format(content["main_theme"]["slug"]),
+                "title": "Theme: {}".format(content["main_theme"]["slug"]).rstrip(),
                 "solution": "n/a",
                 "metadata": {"risk": {"cvss_base_score": 0}},
                 "type": "wpscan_report",
                 "timestamp": timestamp,
-                "description": json.dumps(content["main_theme"], indent=4, sort_keys=True),
+                "description": _parse_description(content["main_theme"]),
             })
             nb_vulns[get_criticity(0)] += 1
             for vulnerability in content["main_theme"]["vulnerabilities"]:
@@ -510,12 +554,12 @@ def _parse_results(scan_id):
                     "issue_id": len(issues)+1,
                     "severity": get_criticity(8), "confidence": "certain",
                     "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                    "title": "Theme {} vulnerability: {}".format(content["main_theme"]["slug"], vulnerability['title']),
+                    "title": "Theme {} vulnerability: {}".format(content["main_theme"]["slug"], vulnerability['title']).rstrip(),
                     "solution": "n/a",
                     "metadata": metadata,
                     "type": "wpscan_report",
                     "timestamp": timestamp,
-                    "description": json.dumps(vulnerability, indent=4, sort_keys=True),
+                    "description": _parse_description(vulnerability),
                 })
                 nb_vulns[get_criticity(8)] += 1
             for parent in content["main_theme"]["parents"]:
@@ -523,12 +567,12 @@ def _parse_results(scan_id):
                     "issue_id": len(issues)+1,
                     "severity": get_criticity(0), "confidence": "certain",
                     "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                    "title": "Theme: {}".format(parent["slug"]),
+                    "title": "Theme: {}".format(parent["slug"]).rstrip(),
                     "solution": "n/a",
                     "metadata": {"risk": {"cvss_base_score": 0}},
                     "type": "wpscan_report",
                     "timestamp": timestamp,
-                    "description": json.dumps(parent, indent=4, sort_keys=True),
+                    "description": _parse_description(parent),
                 })
                 nb_vulns[get_criticity(0)] += 1
                 for vulnerability in parent["vulnerabilities"]:
@@ -539,12 +583,12 @@ def _parse_results(scan_id):
                         "issue_id": len(issues)+1,
                         "severity": get_criticity(8), "confidence": "certain",
                         "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                        "title": "Theme {} vulnerability: {}".format(parent["slug"], vulnerability['title']),
+                        "title": "Theme {} vulnerability: {}".format(parent["slug"], vulnerability['title']).rstrip(),
                         "solution": "n/a",
                         "metadata": metadata,
                         "type": "wpscan_report",
                         "timestamp": timestamp,
-                        "description": json.dumps(vulnerability, indent=4, sort_keys=True),
+                        "description": _parse_description(vulnerability),
                     })
                     nb_vulns[get_criticity(8)] += 1
 
@@ -555,12 +599,12 @@ def _parse_results(scan_id):
                     "issue_id": len(issues)+1,
                     "severity": get_criticity(0), "confidence": "certain",
                     "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                    "title": "Plugin: {}".format(plugin_name),
+                    "title": "Plugin: {}".format(plugin_name).rstrip(),
                     "solution": "n/a",
                     "metadata": {"risk": {"cvss_base_score": 0}},
                     "type": "wpscan_report",
                     "timestamp": timestamp,
-                    "description": json.dumps(content["plugins"][plugin_name], indent=4, sort_keys=True),
+                    "description": _parse_description(content["plugins"][plugin_name]),
                 })
                 nb_vulns[get_criticity(0)] += 1
                 for vulnerability in content["plugins"][plugin_name]["vulnerabilities"]:
@@ -571,12 +615,12 @@ def _parse_results(scan_id):
                         "issue_id": len(issues)+1,
                         "severity": get_criticity(8), "confidence": "certain",
                         "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                        "title": "Plugin {} vulnerability: {}".format(plugin_name, vulnerability['title']),
+                        "title": "Plugin {} vulnerability: {}".format(plugin_name, vulnerability['title']).rstrip(),
                         "solution": "n/a",
                         "metadata": metadata,
                         "type": "wpscan_report",
                         "timestamp": timestamp,
-                        "description": json.dumps(vulnerability, indent=4, sort_keys=True),
+                        "description": _parse_description(vulnerability),
                     })
                     nb_vulns[get_criticity(8)] += 1
 
@@ -587,12 +631,12 @@ def _parse_results(scan_id):
                     "issue_id": len(issues)+1,
                     "severity": get_criticity(0), "confidence": "certain",
                     "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                    "title": "User: {}".format(user_name),
+                    "title": "User: {}".format(user_name).rstrip(),
                     "solution": "n/a",
                     "metadata": {"risk": {"cvss_base_score": 0}},
                     "type": "wpscan_report",
                     "timestamp": timestamp,
-                    "description": json.dumps(content["users"][user_name], indent=4, sort_keys=True),
+                    "description": _parse_description(content["users"][user_name]),
                 })
                 nb_vulns[get_criticity(0)] += 1
 
@@ -602,12 +646,12 @@ def _parse_results(scan_id):
                 "issue_id": len(issues)+1,
                 "severity": get_criticity(0), "confidence": "certain",
                 "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                "title": "Version: {} [{}]".format(content["version"]["number"], content["version"]["release_date"]),
+                "title": "Version: {} [{}]".format(content["version"]["number"], content["version"]["release_date"]).rstrip(),
                 "solution": "n/a",
                 "metadata": {"risk": {"cvss_base_score": 0}},
                 "type": "wpscan_report",
                 "timestamp": timestamp,
-                "description": json.dumps(content["version"], indent=4, sort_keys=True),
+                "description": _parse_description(content["version"]),
             })
             nb_vulns[get_criticity(0)] += 1
             if "status" in content["version"] and content["version"]["status"] != "latest":
@@ -615,12 +659,12 @@ def _parse_results(scan_id):
                     "issue_id": len(issues)+1,
                     "severity": get_criticity(5), "confidence": "certain",
                     "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                    "title": "Version {} [{}] is {}".format(content["version"]["number"], content["version"]["release_date"], content["version"]["status"]),
+                    "title": "Version {} [{}] is {}".format(content["version"]["number"], content["version"]["release_date"], content["version"]["status"]).rstrip(),
                     "solution": "n/a",
                     "metadata": {"risk": {"cvss_base_score": 0}},
                     "type": "wpscan_report",
                     "timestamp": timestamp,
-                    "description": json.dumps(content["version"], indent=4, sort_keys=True),
+                    "description": _parse_description(content["version"]),
                 })
                 nb_vulns[get_criticity(5)] += 1
             for vulnerability in content["version"]["vulnerabilities"]:
@@ -631,12 +675,12 @@ def _parse_results(scan_id):
                     "issue_id": len(issues)+1,
                     "severity": get_criticity(8), "confidence": "certain",
                     "target": {"addr": [asset], "protocol": "http", "parent": asset},
-                    "title": "Wordpress version {} vulnerability: {}".format(content["version"]["number"], vulnerability['title']),
+                    "title": "Wordpress version {} vulnerability: {}".format(content["version"]["number"], vulnerability['title']).rstrip(),
                     "solution": "n/a",
                     "metadata": metadata,
                     "type": "wpscan_report",
                     "timestamp": timestamp,
-                    "description": json.dumps(vulnerability, indent=4, sort_keys=True),
+                    "description": _parse_description(vulnerability),
                 })
                 nb_vulns[get_criticity(8)] += 1
 
@@ -672,7 +716,6 @@ def getfindings(scan_id):
     for asset in engine.scans[scan_id]["reports"].keys():
         proc = engine.scans[scan_id]["reports"][asset]["proc"]
         if hasattr(proc, "pid") and psutil.pid_exists(proc.pid) and psutil.Process(proc.pid).status() in ["sleeping", "running"]:
-            # print "scan not finished"
             has_error = True
             has_error_reason = "Scan in progress"
             break
@@ -725,7 +768,7 @@ def getfindings(scan_id):
 def main():
     """First function called."""
     if not exists(APP_BASE_DIR+"/results"):
-        makedirs(APP_BASE_DIR+"/results")
+        os.makedirs(APP_BASE_DIR+"/results")
     _loadconfig()
     LOG.debug("Run engine")
 

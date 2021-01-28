@@ -21,17 +21,19 @@ from PatrowlEnginesUtils.PatrowlEngineExceptions import PatrowlEngineExceptions
 APP_DEBUG = False
 APP_HOST = "0.0.0.0"
 APP_PORT = 5012
-APP_MAXSCANS = 25
+APP_MAXSCANS = int(os.environ.get('APP_MAXSCANS', 25))
 APP_SEARCH_TWITTER_MAX_COUNT_DEFAULT = 100
 APP_ENGINE_NAME = "owl_leaks"
 APP_BASE_DIR = os.path.dirname(os.path.realpath(__file__))
+VERSION = "1.4.18"
 
 app = Flask(__name__)
 engine = PatrowlEngine(
     app=app,
     base_dir=APP_BASE_DIR,
     name=APP_ENGINE_NAME,
-    max_scans=APP_MAXSCANS
+    max_scans=APP_MAXSCANS,
+    version=VERSION
 )
 
 
