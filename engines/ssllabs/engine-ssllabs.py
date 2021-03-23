@@ -138,7 +138,7 @@ def status():
     # display info on the scanner
     res.update({"scanner": engine.scanner})
     scans = {}
-    for scan in engine.scans.keys():
+    for scan in list(engine.scans.keys()):
         scan_status(scan)
         scans.update({scan: {
             "status": engine.scans[scan]["status"]
@@ -436,6 +436,7 @@ def getfindings(scan_id):
         "issues": issues,
         "summary": summary,
         "status": "success"})
+    clean_scan(scan_id)
     return jsonify(res)
 
 
